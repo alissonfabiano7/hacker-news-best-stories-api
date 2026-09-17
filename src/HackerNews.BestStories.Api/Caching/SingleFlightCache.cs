@@ -4,21 +4,19 @@ namespace HackerNews.BestStories.Api.Caching;
 
 public sealed class SingleFlightCache(TimeProvider clock)
 {
-    private readonly ConcurrentDictionary<string, Lazy<Task<object?>>> _entries = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _expirations = new();
+    private readonly ConcurrentDictionary<string, Entry> _entries = new();
 
     public async Task<T> GetOrCreateAsync<T>(string key, TimeSpan ttl, Func<Task<T>> factory, CancellationToken ct = default)
     {
-        if (_expirations.TryGetValue(key, out var expiresAt) && expiresAt <= clock.GetUtcNow())
+        if (_entries.TryGetValue(key, out var current) && current.IsExpired(clock.GetUtcNow()))
         {
-            _expirations.TryRemove(key, out _);
-            _entries.TryRemove(key, out _);
+            Remove(key, current);
         }
 
-        var entry = _entries.GetOrAdd(key, _ => new Lazy<Task<object?>>(async () =>
+        var entry = _entries.GetOrAdd(key, _ => new Entry(async self =>
         {
             var value = await factory().ConfigureAwait(false);
-            _expirations[key] = clock.GetUtcNow().Add(ttl);
+            self.ExpireAt(clock.GetUtcNow().Add(ttl));
             return value;
         }));
 
@@ -33,8 +31,28 @@ public sealed class SingleFlightCache(TimeProvider clock)
         }
         catch
         {
-            _entries.TryRemove(new KeyValuePair<string, Lazy<Task<object?>>>(key, entry));
+            Remove(key, entry);
             throw;
         }
+    }
+
+    private void Remove(string key, Entry entry) =>
+        _entries.TryRemove(new KeyValuePair<string, Entry>(key, entry));
+
+    private sealed class Entry
+    {
+        private readonly Lazy<Task<object?>> _value;
+        private long _expiresAtUtcTicks = long.MaxValue;
+
+        public Entry(Func<Entry, Task<object?>> load) =>
+            _value = new Lazy<Task<object?>>(() => load(this));
+
+        public Task<object?> Value => _value.Value;
+
+        public bool IsExpired(DateTimeOffset now) =>
+            Volatile.Read(ref _expiresAtUtcTicks) <= now.UtcTicks;
+
+        public void ExpireAt(DateTimeOffset instant) =>
+            Volatile.Write(ref _expiresAtUtcTicks, instant.UtcTicks);
     }
 }

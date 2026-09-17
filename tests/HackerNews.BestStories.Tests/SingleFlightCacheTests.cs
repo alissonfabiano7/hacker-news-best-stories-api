@@ -78,6 +78,37 @@ public class SingleFlightCacheTests
     }
 
     [Fact]
+    public async Task A_slow_caller_that_saw_the_expired_entry_does_not_evict_the_refreshed_one()
+    {
+        var clock = new PausableTimeProvider();
+        var cache = new SingleFlightCache(clock);
+        var calls = 0;
+        var refreshGate = new TaskCompletionSource();
+
+        async Task<int> Factory()
+        {
+            var call = Interlocked.Increment(ref calls);
+            if (call > 1) await refreshGate.Task;
+            return call;
+        }
+
+        Assert.Equal(1, await cache.GetOrCreateAsync("k", Ttl, Factory));
+        clock.Advance(Ttl);
+
+        clock.PauseNextRead();
+        var slow = Task.Run(() => cache.GetOrCreateAsync("k", Ttl, Factory));
+        clock.WaitUntilPaused();
+
+        var fast = cache.GetOrCreateAsync("k", Ttl, Factory);
+        clock.Resume();
+        refreshGate.SetResult();
+
+        Assert.Equal(2, await fast);
+        Assert.Equal(2, await slow);
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
     public async Task A_caller_that_cancels_does_not_fail_the_others()
     {
         var cache = new SingleFlightCache(new FakeTimeProvider());
@@ -93,5 +124,29 @@ public class SingleFlightCacheTests
 
         gate.SetResult();
         Assert.Equal("value", await patient);
+    }
+
+    private sealed class PausableTimeProvider : TimeProvider
+    {
+        private readonly ManualResetEventSlim _paused = new(false);
+        private readonly ManualResetEventSlim _resume = new(false);
+        private DateTimeOffset _now = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        private int _pauseNext;
+
+        public void Advance(TimeSpan by) => _now += by;
+        public void PauseNextRead() => Interlocked.Exchange(ref _pauseNext, 1);
+        public void WaitUntilPaused() => _paused.Wait(TimeSpan.FromSeconds(5));
+        public void Resume() => _resume.Set();
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            if (Interlocked.Exchange(ref _pauseNext, 0) == 1)
+            {
+                _paused.Set();
+                _resume.Wait(TimeSpan.FromSeconds(5));
+            }
+
+            return _now;
+        }
     }
 }

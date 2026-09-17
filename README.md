@@ -80,6 +80,7 @@ How the Hacker News API is protected:
 
 - **Two-level cache.** The list of best story ids is fetched at most once per minute; each story at most once every 5 minutes. A thousand clients asking for `n=500` in that window cost Hacker News one ids call and up to 500 item calls, not a million.
 - **Single flight.** When the cache is cold, N concurrent callers for the same key wait on the same in-flight `Task` instead of each starting their own request. Implemented with `ConcurrentDictionary<string, Lazy<Task<T>>>`: the dictionary's value factory can run more than once under contention, but it only allocates a `Lazy`; the HTTP call lives inside `Lazy.Value`, which runs exactly once per instance.
+- **Expiration lives inside the entry.** Each entry carries its own expiration instant, set when the upstream call completes and checked lazily on read; there is no timer. An expired entry is removed by key *and* instance, so a slow caller that saw the old entry expired cannot evict the fresh one another caller has just created. Without that, a narrow check-then-act race would let two upstream calls through at expiration time.
 - **Failures are not cached.** A failed factory removes its own entry (and only its own, via `TryRemove(KeyValuePair)`), so a transient error is retried by the next caller instead of poisoning the key for the whole TTL.
 - **Bounded concurrency.** A `SemaphoreSlim` caps in-flight item requests to Hacker News at 10, regardless of how many clients are waiting. The semaphore wraps only the upstream call, so cache hits never wait for a slot.
 - **Resilience.** The standard resilience handler from `Microsoft.Extensions.Http.Resilience` adds a per-attempt timeout (10 s), retry with exponential backoff, a circuit breaker and a total request timeout. When the circuit is open the endpoint fails fast with `503`.
@@ -102,9 +103,9 @@ Everything is configurable in `appsettings.json` under `HackerNews` (`BaseUrl`, 
 
 ## Tests
 
-xUnit, 15 tests, no network:
+xUnit, 16 tests, no network:
 
-- `SingleFlightCacheTests`: 50 concurrent callers produce one factory call; values expire exactly at the TTL (using `FakeTimeProvider`, no sleeps); failures are not cached; keys are independent; a cancelling caller does not fail the others.
+- `SingleFlightCacheTests`: 50 concurrent callers produce one factory call; values expire exactly at the TTL (using `FakeTimeProvider`, no sleeps); failures are not cached; keys are independent; a cancelling caller does not fail the others; a slow caller racing on expiration does not evict the refreshed entry (made deterministic with a `TimeProvider` that pauses mid-read).
 - `BestStoriesServiceTests`: sort order; take-then-sort semantics; skipping of missing, deleted and dead items; field mapping (`null` url, `null` descendants, unix time); second call served from cache; concurrency bounded by `MaxConcurrency`; upstream failures propagate to the endpoint.
 - `HackerNewsClientTests`: deserialization of a real item payload and of a sparse deleted item, request path for the ids list. Uses a stub `HttpMessageHandler`.
 
